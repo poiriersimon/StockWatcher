@@ -1,0 +1,49 @@
+{
+    "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+    "Name": "Stock Watcher",
+    "Version": "1.0.0.0",
+    "Author": "StockWatcher",
+    "Description": "Display real-time stock quotes on your Stream Deck using Finnhub API",
+    "Icon": "imgs/plugin-icon",
+    "Category": "Stock Watcher",
+    "CategoryIcon": "imgs/category-icon",
+    "CodePath": "bin/plugin.js",
+    "UUID": "com.simonpoirier.stockwatcher",
+    "SDKVersion": 2,
+    "Software": {
+        "MinimumVersion": "6.6"
+    },
+    "OS": [
+        {
+            "Platform": "mac",
+            "MinimumVersion": "10.15"
+        },
+        {
+            "Platform": "windows",
+            "MinimumVersion": "10"
+        }
+    ],
+    "Nodejs": {
+        "Version": "20",
+        "Debug": "enabled"
+    },
+    "Actions": [
+        {
+            "Name": "Stock Quote",
+            "UUID": "com.simonpoirier.stockwatcher.quote",
+            "Icon": "imgs/action-icon",
+            "Tooltip": "Display a stock quote on press",
+            "PropertyInspectorPath": "ui/stock-quote.html",
+            "Controllers": [
+                "Keypad"
+            ],
+            "States": [
+                {
+                    "Image": "imgs/action-icon",
+                    "TitleAlignment": "middle",
+                    "FontSize": 12
+                }
+            ]
+        }
+    ]
+}
