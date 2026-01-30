@@ -48,13 +48,6 @@
         Enter the stock ticker symbol (e.g., MSFT for Microsoft)
     </div>
 
-    <sdpi-item label="API Key">
-        <sdpi-password setting="apiKey" placeholder="Enter your Finnhub API key"></sdpi-password>
-    </sdpi-item>
-    <div class="info-text">
-        Get your free API key at <a href="https://finnhub.io/" target="_blank">finnhub.io</a>
-    </div>
-
     <sdpi-item label="Refresh Interval">
         <sdpi-select setting="refreshInterval">
             <option value="2000">2 seconds</option>
@@ -66,6 +59,14 @@
             <option value="600000">10 minutes</option>
         </sdpi-select>
     </sdpi-item>
+
+    <div class="section-title">Market Status</div>
+    <div class="legend">
+        <div class="legend-item">☀️ Regular market hours</div>
+        <div class="legend-item">🥐 Pre-market</div>
+        <div class="legend-item">🌗 After-hours</div>
+        <div class="legend-item">🌙 Market closed</div>
+    </div>
 
 </body>
 </html>

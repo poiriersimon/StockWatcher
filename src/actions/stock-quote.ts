@@ -7,31 +7,46 @@ import streamDeck, {
     DidReceiveSettingsEvent,
 } from "@elgato/streamdeck";
 
-const BASE_URL = "https://finnhub.io/api/v1";
+const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
 
-interface Quote {
-    c: number;  // Current price
-    d: number;  // Change
-    dp: number; // Percent change
-    h: number;  // High price of the day
-    l: number;  // Low price of the day
-    o: number;  // Open price of the day
-    pc: number; // Previous close price
-    t: number;  // Timestamp
+// Unified quote interface for display
+interface StockQuote {
+    symbol: string;
+    price: number;           // Current/latest price (includes extended hours)
+    previousClose: number;   // Previous day close
+    change: number;          // Change from previous close
+    changePercent: number;   // Percent change from previous close
+    marketState: "PRE" | "REGULAR" | "POST" | "CLOSED";
 }
 
-interface MarketStatus {
-    exchange: string;
-    holiday: string | null;
-    isOpen: boolean;
-    session: string;
-    timezone: string;
-    t: number;
+interface YahooChartResponse {
+    chart: {
+        result: Array<{
+            meta: {
+                symbol: string;
+                regularMarketPrice: number;
+                previousClose: number;
+                regularMarketTime: number;
+                currentTradingPeriod?: {
+                    pre?: { start: number; end: number };
+                    regular?: { start: number; end: number };
+                    post?: { start: number; end: number };
+                };
+            };
+            timestamp?: number[];
+            indicators?: {
+                quote: Array<{
+                    close: (number | null)[];
+                }>;
+            };
+        }>;
+        error: any;
+    };
 }
 
 type Settings = {
     symbol?: string;
-    apiKey?: string;
+    apiKey?: string;  // Kept for backwards compatibility, not used with Yahoo
     refreshInterval?: string;
 };
 
@@ -39,18 +54,25 @@ async function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function fetchWithBackoff<T>(
+async function fetchWithRetry(
     url: string,
+    options: RequestInit = {},
     maxRetries: number = 3,
     initialDelay: number = 1000
-): Promise<T> {
+): Promise<Response> {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const response = await fetch(url);
+        const response = await fetch(url, {
+            ...options,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                ...options.headers,
+            },
+        });
 
         if (response.ok) {
-            return response.json() as Promise<T>;
+            return response;
         }
 
         if (response.status === 429) {
@@ -64,38 +86,97 @@ async function fetchWithBackoff<T>(
             throw new Error("Rate limit exceeded after maximum retries");
         }
 
-        throw new Error(`Request failed: ${response.statusText}`);
+        throw new Error(`Request failed: ${response.status} ${response.statusText}`);
     }
 
     throw lastError || new Error("Request failed");
 }
 
-async function getQuote(symbol: string, apiKey: string): Promise<Quote> {
-    return fetchWithBackoff<Quote>(
-        `${BASE_URL}/quote?symbol=${symbol}&token=${apiKey}`
-    );
-}
+function determineMarketState(meta: YahooChartResponse['chart']['result'][0]['meta']): StockQuote['marketState'] {
+    const now = Math.floor(Date.now() / 1000);
+    const tradingPeriod = meta.currentTradingPeriod;
 
-async function getMarketStatus(apiKey: string, exchange: string = "US"): Promise<MarketStatus> {
-    return fetchWithBackoff<MarketStatus>(
-        `${BASE_URL}/stock/market-status?exchange=${exchange}&token=${apiKey}`
-    );
-}
+    if (!tradingPeriod) return "CLOSED";
 
-function getMarketEmoji(status: MarketStatus): string {
-    if (!status.isOpen) {
-        return "🌙";  // Closed
+    if (tradingPeriod.pre && now >= tradingPeriod.pre.start && now < tradingPeriod.pre.end) {
+        return "PRE";
     }
+    if (tradingPeriod.regular && now >= tradingPeriod.regular.start && now < tradingPeriod.regular.end) {
+        return "REGULAR";
+    }
+    if (tradingPeriod.post && now >= tradingPeriod.post.start && now < tradingPeriod.post.end) {
+        return "POST";
+    }
+    return "CLOSED";
+}
+
+function getLatestPriceFromCandles(result: YahooChartResponse['chart']['result'][0]): number | null {
+    const timestamps = result.timestamp;
+    const quotes = result.indicators?.quote?.[0];
+
+    if (!timestamps || !quotes?.close) return null;
+
+    // Find the last non-null close price
+    for (let i = timestamps.length - 1; i >= 0; i--) {
+        if (quotes.close[i] !== null) {
+            return quotes.close[i];
+        }
+    }
+    return null;
+}
+
+async function getYahooQuote(symbol: string): Promise<StockQuote> {
+    const url = `${YAHOO_CHART_URL}/${symbol}?interval=1m&range=1d&includePrePost=true`;
     
-    switch (status.session) {
-        case "pre-market":
+    const response = await fetchWithRetry(url);
+    const data = await response.json() as YahooChartResponse;
+
+    if (data.chart.error) {
+        throw new Error(`Yahoo API Error: ${JSON.stringify(data.chart.error)}`);
+    }
+
+    const result = data.chart.result?.[0];
+    if (!result) {
+        throw new Error("No data returned from Yahoo Finance");
+    }
+
+    const meta = result.meta;
+    const marketState = determineMarketState(meta);
+    
+    // Get the latest price - use candle data for extended hours, otherwise regular market price
+    let price: number;
+    if (marketState === "PRE" || marketState === "POST") {
+        const latestCandle = getLatestPriceFromCandles(result);
+        price = latestCandle ?? meta.regularMarketPrice;
+    } else {
+        price = meta.regularMarketPrice;
+    }
+
+    const previousClose = meta.previousClose;
+    const change = price - previousClose;
+    const changePercent = (change / previousClose) * 100;
+
+    return {
+        symbol: meta.symbol,
+        price,
+        previousClose,
+        change,
+        changePercent,
+        marketState,
+    };
+}
+
+function getMarketEmoji(marketState: StockQuote['marketState']): string {
+    switch (marketState) {
+        case "PRE":
             return "🥐";  // Pre-market
-        case "regular":
+        case "REGULAR":
             return "☀️";  // Regular market
-        case "post-market":
+        case "POST":
             return "🌗";  // Post-market
+        case "CLOSED":
         default:
-            return "📊";
+            return "🌙";  // Closed
     }
 }
 
@@ -222,19 +303,19 @@ export class StockQuoteAction extends SingletonAction<Settings> {
      * Update the display with current stock data
      */
     private async updateDisplay(actionId: string, settings: Settings): Promise<void> {
-        const { symbol, apiKey } = settings;
+        const { symbol } = settings;
         const action = streamDeck.actions.getActionById(actionId);
 
         streamDeck.logger.info(`updateDisplay called for ${actionId}`);
-        streamDeck.logger.info(`Symbol: ${symbol}, API Key present: ${!!apiKey}`);
+        streamDeck.logger.info(`Symbol: ${symbol}`);
 
         if (!action) {
             streamDeck.logger.error(`Action not found: ${actionId}`);
             return;
         }
 
-        if (!symbol || !apiKey) {
-            streamDeck.logger.info(`Missing settings - showing setup required`);
+        if (!symbol) {
+            streamDeck.logger.info(`Missing symbol - showing setup required`);
             await action.setTitle("Setup\nRequired");
             return;
         }
@@ -242,19 +323,16 @@ export class StockQuoteAction extends SingletonAction<Settings> {
         try {
             streamDeck.logger.info(`Fetching quote for ${symbol}...`);
             
-            const [quote, marketStatus] = await Promise.all([
-                getQuote(symbol.toUpperCase(), apiKey),
-                getMarketStatus(apiKey)
-            ]);
+            const quote = await getYahooQuote(symbol.toUpperCase());
             
             streamDeck.logger.info(`Quote received: ${JSON.stringify(quote)}`);
             
-            const marketEmoji = getMarketEmoji(marketStatus);
-            const price = quote.c.toFixed(2);
-            const arrow = quote.d >= 0 ? "▲" : "▼";
-            const change = quote.d.toFixed(2);
-            const changePercent = quote.dp.toFixed(2);
-            const isPositive = quote.d >= 0;
+            const marketEmoji = getMarketEmoji(quote.marketState);
+            const price = quote.price.toFixed(2);
+            const arrow = quote.change >= 0 ? "▲" : "▼";
+            const change = quote.change.toFixed(2);
+            const changePercent = quote.changePercent.toFixed(2);
+            const isPositive = quote.change >= 0;
 
             // Generate SVG image with different font sizes per line
             const imageData = generateStockImage(
@@ -271,7 +349,7 @@ export class StockQuoteAction extends SingletonAction<Settings> {
             await action.setImage(imageData);
             await action.setTitle("");  // Clear title since we're using image
             
-            streamDeck.logger.info(`Updated ${symbol}: ${price} (${change})`);
+            streamDeck.logger.info(`Updated ${symbol}: $${price} (${change}, ${quote.marketState})`);
         } catch (error: any) {
             streamDeck.logger.error(`Error fetching ${symbol}: ${error?.message || error}`);
             await action.setTitle(`${symbol}\nError`);

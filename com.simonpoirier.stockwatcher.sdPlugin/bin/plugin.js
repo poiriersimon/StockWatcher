@@ -8017,16 +8017,22 @@ typeof SuppressedError === "function" ? SuppressedError : function (error, suppr
     return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
 };
 
-const BASE_URL = "https://finnhub.io/api/v1";
+const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
-async function fetchWithBackoff(url, maxRetries = 3, initialDelay = 1000) {
+async function fetchWithRetry(url, options = {}, maxRetries = 3, initialDelay = 1000) {
     let lastError = null;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const response = await fetch(url);
+        const response = await fetch(url, {
+            ...options,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                ...options.headers,
+            },
+        });
         if (response.ok) {
-            return response.json();
+            return response;
         }
         if (response.status === 429) {
             if (attempt < maxRetries) {
@@ -8038,29 +8044,84 @@ async function fetchWithBackoff(url, maxRetries = 3, initialDelay = 1000) {
             }
             throw new Error("Rate limit exceeded after maximum retries");
         }
-        throw new Error(`Request failed: ${response.statusText}`);
+        throw new Error(`Request failed: ${response.status} ${response.statusText}`);
     }
     throw lastError || new Error("Request failed");
 }
-async function getQuote(symbol, apiKey) {
-    return fetchWithBackoff(`${BASE_URL}/quote?symbol=${symbol}&token=${apiKey}`);
-}
-async function getMarketStatus(apiKey, exchange = "US") {
-    return fetchWithBackoff(`${BASE_URL}/stock/market-status?exchange=${exchange}&token=${apiKey}`);
-}
-function getMarketEmoji(status) {
-    if (!status.isOpen) {
-        return "🌙"; // Closed
+function determineMarketState(meta) {
+    const now = Math.floor(Date.now() / 1000);
+    const tradingPeriod = meta.currentTradingPeriod;
+    if (!tradingPeriod)
+        return "CLOSED";
+    if (tradingPeriod.pre && now >= tradingPeriod.pre.start && now < tradingPeriod.pre.end) {
+        return "PRE";
     }
-    switch (status.session) {
-        case "pre-market":
+    if (tradingPeriod.regular && now >= tradingPeriod.regular.start && now < tradingPeriod.regular.end) {
+        return "REGULAR";
+    }
+    if (tradingPeriod.post && now >= tradingPeriod.post.start && now < tradingPeriod.post.end) {
+        return "POST";
+    }
+    return "CLOSED";
+}
+function getLatestPriceFromCandles(result) {
+    const timestamps = result.timestamp;
+    const quotes = result.indicators?.quote?.[0];
+    if (!timestamps || !quotes?.close)
+        return null;
+    // Find the last non-null close price
+    for (let i = timestamps.length - 1; i >= 0; i--) {
+        if (quotes.close[i] !== null) {
+            return quotes.close[i];
+        }
+    }
+    return null;
+}
+async function getYahooQuote(symbol) {
+    const url = `${YAHOO_CHART_URL}/${symbol}?interval=1m&range=1d&includePrePost=true`;
+    const response = await fetchWithRetry(url);
+    const data = await response.json();
+    if (data.chart.error) {
+        throw new Error(`Yahoo API Error: ${JSON.stringify(data.chart.error)}`);
+    }
+    const result = data.chart.result?.[0];
+    if (!result) {
+        throw new Error("No data returned from Yahoo Finance");
+    }
+    const meta = result.meta;
+    const marketState = determineMarketState(meta);
+    // Get the latest price - use candle data for extended hours, otherwise regular market price
+    let price;
+    if (marketState === "PRE" || marketState === "POST") {
+        const latestCandle = getLatestPriceFromCandles(result);
+        price = latestCandle ?? meta.regularMarketPrice;
+    }
+    else {
+        price = meta.regularMarketPrice;
+    }
+    const previousClose = meta.previousClose;
+    const change = price - previousClose;
+    const changePercent = (change / previousClose) * 100;
+    return {
+        symbol: meta.symbol,
+        price,
+        previousClose,
+        change,
+        changePercent,
+        marketState,
+    };
+}
+function getMarketEmoji(marketState) {
+    switch (marketState) {
+        case "PRE":
             return "🥐"; // Pre-market
-        case "regular":
+        case "REGULAR":
             return "☀️"; // Regular market
-        case "post-market":
+        case "POST":
             return "🌗"; // Post-market
+        case "CLOSED":
         default:
-            return "📊";
+            return "🌙"; // Closed
     }
 }
 function generateStockImage(symbol, marketEmoji, arrow, price, change, changePercent, isPositive) {
@@ -8171,38 +8232,35 @@ let StockQuoteAction = (() => {
          * Update the display with current stock data
          */
         async updateDisplay(actionId, settings) {
-            const { symbol, apiKey } = settings;
+            const { symbol } = settings;
             const action = streamDeck.actions.getActionById(actionId);
             streamDeck.logger.info(`updateDisplay called for ${actionId}`);
-            streamDeck.logger.info(`Symbol: ${symbol}, API Key present: ${!!apiKey}`);
+            streamDeck.logger.info(`Symbol: ${symbol}`);
             if (!action) {
                 streamDeck.logger.error(`Action not found: ${actionId}`);
                 return;
             }
-            if (!symbol || !apiKey) {
-                streamDeck.logger.info(`Missing settings - showing setup required`);
+            if (!symbol) {
+                streamDeck.logger.info(`Missing symbol - showing setup required`);
                 await action.setTitle("Setup\nRequired");
                 return;
             }
             try {
                 streamDeck.logger.info(`Fetching quote for ${symbol}...`);
-                const [quote, marketStatus] = await Promise.all([
-                    getQuote(symbol.toUpperCase(), apiKey),
-                    getMarketStatus(apiKey)
-                ]);
+                const quote = await getYahooQuote(symbol.toUpperCase());
                 streamDeck.logger.info(`Quote received: ${JSON.stringify(quote)}`);
-                const marketEmoji = getMarketEmoji(marketStatus);
-                const price = quote.c.toFixed(2);
-                const arrow = quote.d >= 0 ? "▲" : "▼";
-                const change = quote.d.toFixed(2);
-                const changePercent = quote.dp.toFixed(2);
-                const isPositive = quote.d >= 0;
+                const marketEmoji = getMarketEmoji(quote.marketState);
+                const price = quote.price.toFixed(2);
+                const arrow = quote.change >= 0 ? "▲" : "▼";
+                const change = quote.change.toFixed(2);
+                const changePercent = quote.changePercent.toFixed(2);
+                const isPositive = quote.change >= 0;
                 // Generate SVG image with different font sizes per line
                 const imageData = generateStockImage(symbol.toUpperCase(), marketEmoji, arrow, price, change, changePercent, isPositive);
                 streamDeck.logger.info(`Setting image for ${symbol}`);
                 await action.setImage(imageData);
                 await action.setTitle(""); // Clear title since we're using image
-                streamDeck.logger.info(`Updated ${symbol}: ${price} (${change})`);
+                streamDeck.logger.info(`Updated ${symbol}: $${price} (${change}, ${quote.marketState})`);
             }
             catch (error) {
                 streamDeck.logger.error(`Error fetching ${symbol}: ${error?.message || error}`);
